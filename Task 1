@@ -1,0 +1,116 @@
+# big_data_analysis.py
+# PySpark Big Data Processing Script
+# ----------------------------------
+# This script demonstrates scalability of PySpark on a hypothetical large dataset.
+# It generates synthetic data, processes it, and derives insights.
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, avg, count, when, stddev, expr, to_date, sum as sum_
+import pyspark.sql.functions as F
+import time
+
+def main():
+    # 1. Initialize Spark session
+    spark = SparkSession.builder \
+        .appName("Hypothetical Big Data Analysis") \
+        .config("spark.sql.shuffle.partitions", "200") \
+        .config("spark.executor.memory", "2g") \
+        .master("local[*]") \
+        .getOrCreate()
+
+    # 2. Generate synthetic dataset
+    # Simulate 10 million records of user transactions
+    num_records = 10_000_000
+
+    def generate_data(n):
+        import pandas as pd
+        import numpy as np
+        import uuid
+        np.random.seed(42)
+        df = pd.DataFrame({
+            'transaction_id': [str(uuid.uuid4()) for _ in range(n)],
+            'user_id': np.random.randint(1, 1_000_000, size=n),
+            'transaction_amount': np.round(np.random.exponential(scale=50, size=n), 2),
+            'transaction_type': np.random.choice(
+                ['purchase', 'refund', 'withdrawal', 'deposit'],
+                size=n,
+                p=[0.7, 0.05, 0.15, 0.1]
+            ),
+            'transaction_time': pd.to_datetime('2025-01-01') +
+                                pd.to_timedelta(np.random.randint(0, 365, size=n), unit='d')
+        })
+        return df
+
+    start = time.time()
+    pdf = generate_data(num_records)
+    sdf = spark.createDataFrame(pdf)
+    print(f"Data creation & load took {time.time() - start:.2f} seconds")
+
+    # Persist dataset in memory for iterative queries
+    sdf = sdf.repartition(200).persist()
+
+    # 3. Basic data profiling
+    total_count = sdf.count()
+    unique_users = sdf.select('user_id').distinct().count()
+    amount_stats = sdf.select(
+        F.min('transaction_amount').alias('min_amt'),
+        F.max('transaction_amount').alias('max_amt'),
+        F.mean('transaction_amount').alias('avg_amt'),
+        F.stddev('transaction_amount').alias('std_dev_amt')
+    ).collect()[0]
+
+    print(f"Total Transactions: {total_count}")
+    print(f"Unique Users: {unique_users}")
+    print(f"Transaction Amounts -> Min: {amount_stats.min_amt}, Max: {amount_stats.max_amt}, "
+          f"Avg: {amount_stats.avg_amt:.2f}, StdDev: {amount_stats.std_dev_amt:.2f}")
+
+    # 4. Transaction counts by type
+    counts_by_type = sdf.groupBy('transaction_type').agg(
+        count('*').alias('count'),
+        F.round(avg('transaction_amount'), 2).alias('avg_amt')
+    ).orderBy('count', ascending=False)
+
+    counts_by_type.show()
+
+    # 5. Time-series analysis: daily total amounts
+    daily_amounts = sdf.groupBy(to_date('transaction_time').alias('date')).agg(
+        sum_('transaction_amount').alias('total_amt'),
+        count('*').alias('num_txn')
+    ).orderBy('date')
+
+    daily_amounts.show(10)
+
+    # 6. User segmentation: high-value users (total spend > 95th percentile)
+    user_spend = sdf.groupBy('user_id').agg(
+        sum_('transaction_amount').alias('total_spent'),
+        count('*').alias('txn_count')
+    )
+    threshold = user_spend.approxQuantile('total_spent', [0.95], 0.01)[0]
+    high_value = user_spend.filter(col('total_spent') >= threshold)
+    num_high_value = high_value.count()
+    average_high_value = high_value.agg(F.mean('total_spent')).collect()[0][0]
+
+    print(f"95th percentile spend threshold: {threshold:.2f}")
+    print(f"Number of high-value users: {num_high_value}")
+    print(f"Avg spend among high-value users: {average_high_value:.2f}")
+
+    # 7. Insights summary
+    insights = {
+        'total_transactions': total_count,
+        'unique_users': unique_users,
+        'avg_transaction_amount': amount_stats.avg_amt,
+        'most_common_transaction_type': counts_by_type.first()['transaction_type'],
+        'peak_date_by_amount': daily_amounts.orderBy(col('total_amt').desc()).first()['date'],
+        'high_value_user_threshold': threshold,
+        'num_high_value_users': num_high_value
+    }
+
+    print("Insights Derived:")
+    for k, v in insights.items():
+        print(f"- {k}: {v}")
+
+    spark.stop()
+
+
+if _name_ == "_main_":
+    main()
